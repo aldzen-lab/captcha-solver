@@ -67,12 +67,12 @@ app = FastAPI(
 # the endpoint proceeds — real enforcement stays at the Caddy layer (public domain only).
 _bearer = HTTPBearer(auto_error=False, description="Bearer token (required on the public "
                      "domain; enforced by the reverse proxy). Ignored for local calls.")
-SUPPORTED = ["turnstile", "recaptcha", "hcaptcha", "cloudflare", "awswaf", "botguard", "datadome", "perimeterx"]
+SUPPORTED = ["turnstile", "recaptcha", "hcaptcha", "cloudflare", "awswaf", "botguard", "datadome", "perimeterx", "akamai", "aliyun"]
 # Page-level solvers that harvest a cookie/token from the live page (no sitekey needed).
-_PAGE_LEVEL = ("cloudflare", "awswaf", "botguard", "datadome", "perimeterx")
+_PAGE_LEVEL = ("cloudflare", "awswaf", "botguard", "datadome", "perimeterx", "akamai")
 # Solvers that supply their own canonical URL (caller need not pass `url`).
 # datadome is NOT here: the caller passes the DataDome-fronted url (+ referer) itself.
-_SELF_URL = ("botguard", "perimeterx")
+_SELF_URL = ("botguard", "perimeterx", "aliyun")
 # Allow private/loopback targets only when explicitly opted in (dev/testing).
 _ALLOW_PRIVATE = os.getenv("SOLVER_ALLOW_PRIVATE") == "1"
 
@@ -220,6 +220,14 @@ class SolveRequest(BaseModel):
     # perimeterx-only (HUMAN/PerimeterX 'Press & Hold')
     render_flow: Optional[str] = Field(None, description="perimeterx: named site trigger that makes the gate render when it doesn't show on plain load (default 'outlook_signup'). Throwaway navigation only — NOT account creation. Pass null with a `url` for deployments whose gate renders on goto(). Harvests the _px3 clearance cookie (bound to _pxvid+IP+UA; replay under the same proxy+UA within TTL).")
 
+    # aliyun-only (Aliyun Captcha 2.0 slide-puzzle). No sitekey — the challenge identity
+    # is scene_id + prefix (prefix selects the captcha-open endpoint). Harvest-only:
+    # returns {sceneId, certifyId, deviceToken, data}; the caller replays it immediately
+    # into VerifyCaptchaV3 (token is session-bound + one-time-use, deviceToken time-bound).
+    scene_id: Optional[str] = Field(None, description="aliyun: the SceneId of the target site's captcha (e.g. read from the page config). Required for type=aliyun.")
+    prefix: Optional[str] = Field(None, description="aliyun: the captcha-open endpoint prefix (e.g. '13lbkb5' -> <prefix>.captcha-open-southeast.aliyuncs.com). Required for type=aliyun.")
+    region: Optional[str] = Field(None, description="aliyun: captcha region — 'sgp' (default), 'cn', or 'intl'.")
+
 
 # Named request examples → Swagger UI renders these as a dropdown picker on /solve.
 _SOLVE_EXAMPLES = {
@@ -269,6 +277,12 @@ _SOLVE_EXAMPLES = {
         "value": {"type": "datadome",
                   "url": "https://octocaptcha.com/datadome?origin_page=github_signup_redesign",
                   "referer": "https://github.com/",
+                  "proxy": "http://user:pass@ip:port"},
+    },
+    "akamai": {
+        "summary": "Harvest an Akamai Bot Manager _abck clearance cookie (caller passes the Akamai-fronted url)",
+        "value": {"type": "akamai",
+                  "url": "https://www.example-akamai-site.com/",
                   "proxy": "http://user:pass@ip:port"},
     },
     "perimeterx": {
@@ -411,6 +425,19 @@ async def _dispatch(req: SolveRequest) -> dict:
             proxy=req.proxy, timeout_s=req.timeout_s or 200)
         return {"type": "perimeterx", **r}
 
+    if req.type == "akamai":
+        from akamai.solve import solve_akamai
+        actions, fetches = _extract(req)
+        r = await solve_akamai(req.url, req.proxy, req.timeout_s or 90, actions, fetches)
+        return {"type": "akamai", **r}
+
+    if req.type == "aliyun":
+        from aliyun.solve import solve_aliyun
+        r = await solve_aliyun(
+            scene_id=req.scene_id, prefix=req.prefix, region=req.region or "sgp",
+            proxy=req.proxy, timeout_s=req.timeout_s or 90)
+        return {"type": "aliyun", **r}
+
     # reCAPTCHA
     from recaptcha.solve import (
         solve_recaptcha_v3, solve_recaptcha_v3_realpage, solve_recaptcha_invisible,
@@ -488,7 +515,9 @@ async def solve(req: SolveRequest = Body(..., openapi_examples=_SOLVE_EXAMPLES))
                    "&clcid=0x409&culture=en-us&country=us")
     if not req.url and req.type not in _SELF_URL:  # goto("") is meaningless
         raise HTTPException(400, "url is required")
-    if req.type not in _PAGE_LEVEL and not req.sitekey:
+    if req.type == "aliyun" and (not req.scene_id or not req.prefix):
+        raise HTTPException(400, "scene_id and prefix are required for type=aliyun")
+    if req.type not in _PAGE_LEVEL and req.type != "aliyun" and not req.sitekey:
         raise HTTPException(400, f"sitekey is required for type={req.type}")
     _validate_urls(req)
 
