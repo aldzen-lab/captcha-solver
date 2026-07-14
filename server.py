@@ -2,9 +2,11 @@
 import asyncio
 import ipaddress
 import itertools
+import json
 import logging
 import os
 import socket
+import sys
 import time
 from collections import deque
 from typing import Any, Optional
@@ -433,10 +435,32 @@ async def _dispatch(req: SolveRequest) -> dict:
         return {"type": "akamai", **r}
 
     if req.type == "aliyun":
-        from aliyun.solve import solve_aliyun
-        r = await solve_aliyun(
-            scene_id=req.scene_id, prefix=req.prefix, region=req.region or "sgp",
-            proxy=req.proxy, timeout_s=req.timeout_s or 90)
+        # Dispatch to a SUBPROCESS (aliyun._run), not an inline await. The drag trajectory
+        # depends on precise CDP Input.dispatchMouseEvent timing that is fidelity-sensitive
+        # to running on the MAIN thread with a clean event loop. Proven empirically:
+        #   asyncio.run(solve_aliyun) on main thread   -> 3/3 T001
+        #   awaited on uvicorn's loop                  -> 0/12 F001
+        #   asyncio.run inside asyncio.to_thread       -> 0/12 F001 (off main thread)
+        # A subprocess runs its own main-thread asyncio.run, exactly reproducing the
+        # working direct-call conditions -> T001.
+        import os as _os
+        _to = req.timeout_s or 90
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "aliyun._run",
+            req.scene_id or "", req.prefix or "", req.region or "sgp",
+            str(_to), req.proxy or "",
+            cwd=_os.path.dirname(_os.path.abspath(__file__)),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=_to + 30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return {"type": "aliyun", "solved": False, "error": "subprocess deadline"}
+        r = {"solved": False, "error": "no result from runner"}
+        for line in (out or b"").decode(errors="replace").splitlines():
+            if line.startswith("__ALIYUN_RESULT__"):
+                r = json.loads(line[len("__ALIYUN_RESULT__"):])
+                break
         return {"type": "aliyun", **r}
 
     # reCAPTCHA

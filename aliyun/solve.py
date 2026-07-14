@@ -23,11 +23,14 @@ import datetime
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 import urllib.parse
 import uuid
 from pathlib import Path
+
+log = logging.getLogger("aliyun")
 
 import numpy as np
 from cloakbrowser import launch_async
@@ -228,10 +231,14 @@ async def solve_aliyun(scene_id: str, prefix: str, region: str = "sgp",
 
             tok = await page.evaluate("()=>window.__verify||null")
             if not tok:
+                log.info("aliyun attempt %d: method=%s gap_x=%s dist=%.1f -> NO CALLBACK",
+                         attempt, g.get("method", "cv2"), g["gap_x"], dist)
                 continue
             token = tok if isinstance(tok, dict) else json.loads(tok)
             code = await _verify_in_page(page, token, scene_id, prefix)
             last_code = code
+            log.info("aliyun attempt %d: method=%s gap_x=%s dist=%.1f -> %s",
+                     attempt, g.get("method", "cv2"), g["gap_x"], dist, code)
             if code == "T001":
                 return {
                     "solved": True, "token": token, "verify_code": code,
