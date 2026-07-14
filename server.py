@@ -67,9 +67,12 @@ app = FastAPI(
 # the endpoint proceeds — real enforcement stays at the Caddy layer (public domain only).
 _bearer = HTTPBearer(auto_error=False, description="Bearer token (required on the public "
                      "domain; enforced by the reverse proxy). Ignored for local calls.")
-SUPPORTED = ["turnstile", "recaptcha", "hcaptcha", "cloudflare", "awswaf", "botguard"]
+SUPPORTED = ["turnstile", "recaptcha", "hcaptcha", "cloudflare", "awswaf", "botguard", "datadome", "perimeterx"]
 # Page-level solvers that harvest a cookie/token from the live page (no sitekey needed).
-_PAGE_LEVEL = ("cloudflare", "awswaf", "botguard")
+_PAGE_LEVEL = ("cloudflare", "awswaf", "botguard", "datadome", "perimeterx")
+# Solvers that supply their own canonical URL (caller need not pass `url`).
+# datadome is NOT here: the caller passes the DataDome-fronted url (+ referer) itself.
+_SELF_URL = ("botguard", "perimeterx")
 # Allow private/loopback targets only when explicitly opted in (dev/testing).
 _ALLOW_PRIVATE = os.getenv("SOLVER_ALLOW_PRIVATE") == "1"
 
@@ -211,6 +214,12 @@ class SolveRequest(BaseModel):
     email: Optional[str] = Field(None, description="BotGuard: account email to enter — drives the sign-in flow to the token-bearing RPC.")
     password: Optional[str] = Field(None, description="BotGuard: optional password — if set, drives to the password step and grabs the B4hajb hard-gate token instead of the MI613e lookup token.")
 
+    # datadome-only (DataDome bot-management clearance cookie)
+    referer: Optional[str] = Field(None, description="datadome: optional framing Referer so DataDome serves the same config/scoring as the real flow. The caller supplies its own site's referer (e.g. https://github.com/ when harvesting via octocaptcha). Pair with a `url` pointing at the DataDome-fronted page that loads tags.js.")
+
+    # perimeterx-only (HUMAN/PerimeterX 'Press & Hold')
+    render_flow: Optional[str] = Field(None, description="perimeterx: named site trigger that makes the gate render when it doesn't show on plain load (default 'outlook_signup'). Throwaway navigation only — NOT account creation. Pass null with a `url` for deployments whose gate renders on goto(). Harvests the _px3 clearance cookie (bound to _pxvid+IP+UA; replay under the same proxy+UA within TTL).")
+
 
 # Named request examples → Swagger UI renders these as a dropdown picker on /solve.
 _SOLVE_EXAMPLES = {
@@ -254,6 +263,18 @@ _SOLVE_EXAMPLES = {
         "summary": "BotGuard (Google OAuth bgRequest token + session cookies)",
         "value": {"type": "botguard", "email": "user@example.com",
                   "password": "optional-for-hard-gate-token"},
+    },
+    "datadome": {
+        "summary": "DataDome clearance cookie — caller passes the DataDome-fronted url (+ referer)",
+        "value": {"type": "datadome",
+                  "url": "https://octocaptcha.com/datadome?origin_page=github_signup_redesign",
+                  "referer": "https://github.com/",
+                  "proxy": "http://user:pass@ip:port"},
+    },
+    "perimeterx": {
+        "summary": "PerimeterX/HUMAN 'Press & Hold' → harvest _px3 clearance cookie (render_flow trigger)",
+        "value": {"type": "perimeterx", "render_flow": "outlook_signup",
+                  "proxy": "http://user:pass@ip:port"},
     },
 }
 
@@ -376,6 +397,20 @@ async def _dispatch(req: SolveRequest) -> dict:
             proxy=req.proxy, timeout_s=req.timeout_s or 90, pre_actions=actions)
         return {"type": "botguard", **r}
 
+    if req.type == "datadome":
+        from datadome.solve import solve_datadome
+        r = await solve_datadome(
+            url=req.url, referer=req.referer,
+            proxy=req.proxy, timeout_s=req.timeout_s or 60)
+        return {"type": "datadome", **r}
+
+    if req.type == "perimeterx":
+        from perimeterx.solve import solve_perimeterx
+        r = await solve_perimeterx(
+            url=req.url, render_flow=req.render_flow or "outlook_signup",
+            proxy=req.proxy, timeout_s=req.timeout_s or 200)
+        return {"type": "perimeterx", **r}
+
     # reCAPTCHA
     from recaptcha.solve import (
         solve_recaptcha_v3, solve_recaptcha_v3_realpage, solve_recaptcha_invisible,
@@ -444,10 +479,14 @@ async def solve(req: SolveRequest = Body(..., openapi_examples=_SOLVE_EXAMPLES))
     """
     if req.type not in SUPPORTED:
         raise HTTPException(400, f"Unsupported type: {req.type}. Supported: {SUPPORTED}")
-    # botguard defaults its own sign-in URL; every other type needs an explicit one.
+    # Self-URL solvers default their own canonical URL so downstream logging has a str.
     if req.type == "botguard" and not req.url:
         req.url = "https://accounts.google.com/signin/v2/identifier?flowName=GlifWebSignIn"
-    if not req.url:  # pydantic makes url required but allows ""; goto("") is meaningless
+    if req.type == "perimeterx" and not req.url:
+        # PerimeterX press-hold gate is reached via the new-@outlook.com-mailbox flow.
+        req.url = ("https://go.microsoft.com/fwlink/p/?linkid=2125440"
+                   "&clcid=0x409&culture=en-us&country=us")
+    if not req.url and req.type not in _SELF_URL:  # goto("") is meaningless
         raise HTTPException(400, "url is required")
     if req.type not in _PAGE_LEVEL and not req.sitekey:
         raise HTTPException(400, f"sitekey is required for type={req.type}")

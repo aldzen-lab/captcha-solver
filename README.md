@@ -5,30 +5,42 @@ Local captcha-solving HTTP sidecar built on the `cloakbrowser` Python library
 running them in a real browser engine — no per-solve cost to external providers
 for the browser-based paths.
 
-Supported types (5): **Turnstile**, **reCAPTCHA** (v2 / v3 / invisible, incl.
+**Scope:** a solver SOLVES the captcha + harvests a replayable token. Account
+creation and form recon (CSRF/honeypot scraping, filling account fields) are the
+**caller's** job, not this service.
+
+Supported types (8): **Turnstile**, **reCAPTCHA** (v2 / v3 / invisible, incl.
 Enterprise), **hCaptcha** (checkbox / invisible / real-page), **Cloudflare**
-(`cf_clearance`), **AWS WAF** (`aws-waf-token`, silent JS challenge).
+(`cf_clearance`), **AWS WAF** (`aws-waf-token`, silent JS challenge), **BotGuard**
+(Google OAuth `bgRequest` token), **DataDome** (`datadome` clearance cookie —
+caller passes the DataDome-fronted url + referer, e.g. GitHub's octocaptcha signup
+gate), **PerimeterX** (HUMAN "Press & Hold" → `_px3` cookie via a real CDP press-hold
+gesture that drives the SHA-256 hashcash PoW Worker + biomechanics).
 
 ## Architecture
 
 ```
 client ──HTTP──> server.py (FastAPI, :8877)
                      │ dispatch by `type`
-                     ├── turnstile/solve.py    (CloakBrowser, headless)
-                     ├── recaptcha/solve.py     (CloakBrowser, headed via Xvfb)
-                     ├── hcaptcha/solve.py      (CloakBrowser)
-                     ├── cloudflare/solve.py    (CloakBrowser — cf_clearance harvester)
-                     └── awswaf/solve.py        (CloakBrowser — aws-waf-token harvester)
+                     ├── turnstile/solve.py     (CloakBrowser, headless)
+                     ├── recaptcha/solve.py      (CloakBrowser, headed via Xvfb)
+                     ├── hcaptcha/solve.py       (CloakBrowser)
+                     ├── cloudflare/solve.py     (CloakBrowser — cf_clearance harvester)
+                     ├── awswaf/solve.py         (CloakBrowser — aws-waf-token harvester)
+                     ├── botguard/solve.py       (CloakBrowser — Google OAuth bgRequest token)
+                     ├── datadome/solve.py       (CloakBrowser — datadome cookie; caller passes url+referer)
+                     └── perimeterx/solve.py     (CloakBrowser — _px3 via CDP press-hold; renderers/ trigger the gate)
 ```
 
 Each sub-solver launches CloakBrowser via `cloakbrowser.launch_async()`,
-drives the challenge widget, and returns the solved token.
+drives/harvests the challenge, and returns a replayable token. Every solver is
+**harvest-only** — it never creates accounts or fills account fields.
 
 ## Endpoints
 
 | Method | Path       | Auth        | Description                                  |
 | ------ | ---------- | ----------- | -------------------------------------------- |
-| GET    | `/health`  | public      | Liveness + supported types (5)               |
+| GET    | `/health`  | public      | Liveness + supported types (8)               |
 | GET    | `/status`  | token       | Service status + list of currently running tasks |
 | GET    | `/logs`    | token       | Last N solve events (buffer holds up to 100; `lines` caps at 200 but returns only what's buffered; `total` is the full buffer size) |
 | POST   | `/solve`   | token       | Solve a captcha (dispatch by `type`)         |
@@ -123,9 +135,9 @@ when you deliberately need to hit an internal target.
 
 ```jsonc
 {
-  "type": "turnstile",          // turnstile | recaptcha | hcaptcha | cloudflare | awswaf  (required)
-  "sitekey": "0x4AAA...",        // site key (widget types only — cloudflare/awswaf are
-                                 //   page-level and need NO sitekey)
+  "type": "turnstile",          // turnstile | recaptcha | hcaptcha | cloudflare | awswaf | botguard | datadome | perimeterx  (required)
+  "sitekey": "0x4AAA...",        // site key (widget types only — cloudflare/awswaf/botguard/
+                                 //   datadome/perimeterx are page-level and need NO sitekey)
   "url": "https://target.com",   // page the captcha is on            (required)
 
   // optional, all types
@@ -334,6 +346,69 @@ returned `user_agent` (see the Cloudflare "Replay contract" above; it applies
 verbatim). If AWS returns a **CloudFront block** page, the solver detects it early
 (title check) and retries once through the proxy before giving up.
 
+## BotGuard (Google OAuth `bgRequest` token)
+
+`POST /solve` with `type: "botguard"` drives Google's OAuth sign-in in CloakBrowser
+and extracts the `bgRequest` **BotGuard token** (the anti-automation token Google
+attaches to the account-lookup / password RPCs). Page-level, self-URL (defaults to
+the Google sign-in URL), no sitekey.
+
+```bash
+curl -X POST http://127.0.0.1:8877/solve -H "Content-Type: application/json" \
+  -d '{"type":"botguard","email":"user@example.com","password":"optional-for-hard-gate-token"}'
+```
+
+- `email` drives the flow to the account-lookup RPC (`MI613e` soft-signal token).
+- `password` (optional) drives to the password step for the `B4hajb` hard-gate token.
+- The token is **session-bound** — replay from the harvested session cookies + UA.
+
+## DataDome (`datadome` clearance cookie)
+
+`POST /solve` with `type: "datadome"` loads a **caller-supplied** DataDome-fronted
+`url` (the page/iframe that runs `tags.js`), lets the silent PoW payload post to
+`api-js.datadome.co/js/`, and harvests the `datadome` cookie from the response. The
+solver is **site-agnostic** — it hardcodes no site, ddk, or referer. See
+`datadome/README.md` for the full contract.
+
+```bash
+# GitHub signup (octocaptcha broker, backend DataDome v5.8.0):
+curl -X POST http://127.0.0.1:8877/solve -H "Content-Type: application/json" \
+  -d '{"type":"datadome",
+       "url":"https://octocaptcha.com/datadome?origin_page=github_signup_redesign",
+       "referer":"https://github.com/",
+       "proxy":"http://user:pass@ip:port"}'
+```
+
+- `url` (**required**): the DataDome-fronted page the caller wants cleared.
+- `referer` (optional): framing Referer so DataDome scores the same config.
+- Cookie is **IP + UA bound** — replay from the same proxy IP + returned `user_agent`.
+- octocaptcha specifics (URL, referer) belong to the caller — the caller's
+  auto-register script also scrapes GitHub's `timestamp_secret`/honeypot for the
+  signup POST. That form recon is NOT this service's job.
+
+## PerimeterX (HUMAN "Press & Hold" → `_px3`)
+
+`POST /solve` with `type: "perimeterx"` reaches the HUMAN/PerimeterX press-hold gate,
+actuates a **real CDP `mouseDown → hold → mouseUp`** (which lets the SHA-256 hashcash
+PoW Web Worker finish + the sensor VM record biomechanics → PerimeterX mints `_px3`),
+and harvests the cookie bundle. See `perimeterx/README.md` for the full contract.
+
+```bash
+curl -X POST http://127.0.0.1:8877/solve -H "Content-Type: application/json" \
+  -d '{"type":"perimeterx","render_flow":"outlook_signup","proxy":"http://user:pass@ip:port"}'
+```
+
+- `render_flow` (optional, default `outlook_signup`): named site trigger from
+  `perimeterx/renderers/` that surfaces the gate when it doesn't render on a plain
+  load. For Outlook the gate only appears after a **throwaway** signup form walk
+  (no standalone URL) — those typed values are disposable triggers, NOT account data;
+  the solver never submits CreateAccount.
+- `url` + `render_flow=null` for deployments whose gate renders on load.
+- `_px3` is **bound to `_pxvid` + IP + UA** with a short TTL — replay the whole cookie
+  bundle from the same proxy IP + returned `user_agent`, within TTL.
+- The gate is **intermittent** (silent-pass on some sessions) — no gate → the solver
+  honestly reports `solved:false` / `gate_reached:false`, never a fake success.
+
 ## Files
 
 ```
@@ -353,10 +428,23 @@ captcha-solver/
 ├── hcaptcha/image_solve.py
 ├── cloudflare/solve.py    # cf_clearance (full-page Managed / JS challenge) harvester
 ├── cloudflare/_selfcheck.py
-└── awswaf/                # aws-waf-token (silent JS challenge) harvester
-    ├── solve.py
-    ├── _selfcheck.py
-    └── __init__.py
+├── awswaf/                # aws-waf-token (silent JS challenge) harvester
+│   ├── solve.py
+│   ├── _selfcheck.py
+│   └── __init__.py
+├── botguard/              # Google OAuth bgRequest token extraction
+│   ├── solve.py
+│   └── README.md
+├── datadome/              # datadome clearance cookie (site-agnostic; caller passes url+referer)
+│   ├── solve.py
+│   ├── _selfcheck.py
+│   └── README.md
+└── perimeterx/            # HUMAN "Press & Hold" → _px3 (CDP press-hold + PoW)
+    ├── solve.py           #   site-agnostic core: detect gate → press-hold → harvest
+    ├── renderers/         #   per-site gate triggers (render_flow param)
+    │   ├── __init__.py    #     RENDERERS registry
+    │   └── outlook.py     #     outlook_signup: throwaway form nav to surface the gate
+    └── README.md
 ```
 
 > The per-package `mistral.py` and `apikey.txt` were consolidated into `common/`
